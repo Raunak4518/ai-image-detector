@@ -1,87 +1,111 @@
 import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import transforms
+from torchvision import transforms, models
 from PIL import Image
+import numpy as np
 
+# --- 1. CONFIGURATION ---
+# Make sure this matches the name of the file you upload to GitHub
+MODEL_PATH = 'dual_stream_final.pth' 
 
-MODEL_PATH = 'dual_stream_final.pth'
-CLASS_NAMES = ['Human', 'AI']  # Update order based on your training (e.g., 0=Human, 1=AI)
+# --- 2. DEFINE THE MODEL ARCHITECTURE ---
+# We paste the exact class from your training code here.
+# NOTE: We set weights=None to avoid downloading ImageNet weights, 
+# since we are about to overwrite them with your trained weights anyway.
+class DualStreamNet(nn.Module):
+    def __init__(self):
+        super().__init__()
 
+        # Stream 1 (EfficientNet B4)
+        self.stream1 = models.efficientnet_b4(weights=None)
+        self.stream1.classifier = nn.Identity()
+
+        # Stream 2 (DenseNet 121)
+        self.stream2 = models.densenet121(weights=None)
+        self.stream2.classifier = nn.Identity()
+
+        # Fusion head
+        self.fc = nn.Sequential(
+            nn.Linear(1792 + 1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, x):
+        f1 = self.stream1(x)
+        f2 = self.stream2(x)
+        fused = torch.cat([f1, f2], dim=1)
+        return self.fc(fused)
+
+# --- 3. MODEL LOADING ---
 @st.cache_resource
 def load_model():
-    """
-    Loads the model. 
-    NOTE: If you saved only the state_dict (weights), you must instantiate 
-    the model architecture first.
-    """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
     try:
-        # OPTION A: If you saved the entire model (torch.save(model, 'model.pth'))
-        model = torch.load(MODEL_PATH, map_location=device)
+        device = torch.device('cpu') # Force CPU for Streamlit Cloud
+        model = DualStreamNet()
         
-        # OPTION B: If you saved only weights (torch.save(model.state_dict(), 'model.pth'))
-        # You must uncomment the lines below and replace 'YourModelClass' with your actual class
-        # model = YourModelClass() 
-        # model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-        
+        # Load the weights
+        # map_location='cpu' is crucial for deploying on servers without GPUs
+        state_dict = torch.load(MODEL_PATH, map_location=device)
+        model.load_state_dict(state_dict)
         model.eval()
-        return model, device
+        return model
     except Exception as e:
-        st.error(f"Error loading model: {e}")
-        return None, None
+        st.error(f"Error loading model. Make sure '{MODEL_PATH}' is in the same folder.")
+        st.error(f"Details: {e}")
+        return None
 
-# --- 2. IMAGE PREPROCESSING ---
-def transform_image(image):
-    """
-    Apply the same transformations used during training.
-    """
+# --- 4. PREPROCESSING ---
+# Using the exact same transforms as your validation set
+def process_image(image):
     transform = transforms.Compose([
-        transforms.Resize((224, 224)), # Adjust size to match your model input
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Standard ImageNet stats
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
     ])
     return transform(image).unsqueeze(0) # Add batch dimension
 
-# --- 3. STREAMLIT UI ---
-st.title("🕵️‍♂️ AI vs. Human Image Detector")
-st.write("Upload an image to detect if it is Real (Human) or AI-Generated.")
+# --- 5. APP INTERFACE ---
+st.title("🛡️ AI Image Detector")
+st.write("Upload an image to check if it's **Real** or **AI-Generated**.")
 
-# File Uploader
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # Display the uploaded image
+    # Display image
     image = Image.open(uploaded_file).convert('RGB')
     st.image(image, caption='Uploaded Image', use_column_width=True)
     
-    # Run Inference
     if st.button('Analyze Image'):
-        model, device = load_model()
-        
-        if model:
-            with st.spinner('Analyzing...'):
-                # Preprocess
-                input_tensor = transform_image(image).to(device)
+        with st.spinner('Scanning...'):
+            model = load_model()
+            
+            if model:
+                # Prepare input
+                input_tensor = process_image(image)
                 
-                # Predict
+                # Inference
                 with torch.no_grad():
-                    output = model(input_tensor)
-                    
-                    # Calculate probabilities (Softmax or Sigmoid depending on your model)
-                    # Assuming Softmax for 2 classes here:
-                    probabilities = torch.nn.functional.softmax(output, dim=1)
-                    confidence, predicted_class = torch.max(probabilities, 1)
-                    
-                    # Map to label
-                    label = CLASS_NAMES[predicted_class.item()]
-                    score = confidence.item() * 100
+                    logit = model(input_tensor)
+                    probability = torch.sigmoid(logit).item()
                 
-                # Display Results
-                if label == 'AI':
-                    st.error(f"**Prediction:** {label} Generated Image")
+                # Logic: In your training, 1_fake means 1 is Fake.
+                # Probability > 0.5 implies Class 1 (Fake)
+                is_fake = probability > 0.5
+                
+                # Dynamic Color & Label
+                if is_fake:
+                    confidence = probability
+                    st.error(f"### 🚨 Prediction: AI-GENERATED (FAKE)")
+                    st.progress(confidence)
+                    st.write(f"**Confidence:** {confidence:.2%}")
                 else:
-                    st.success(f"**Prediction:** {label} Image")
-                    
-                st.info(f"**Confidence:** {score:.2f}%")
+                    confidence = 1 - probability
+                    st.success(f"### ✅ Prediction: REAL HUMAN IMAGE")
+                    st.progress(confidence)
+                    st.write(f"**Confidence:** {confidence:.2%}")
